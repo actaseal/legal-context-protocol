@@ -25,7 +25,7 @@ dependencies = []
 [project.urls]
 Homepage = "https://legalcontextprotocol.org"
 Specification = "https://github.com/legal-context-protocol/legal-context-protocol"
-Source = "https://github.com/legal-context-protocol/legal-context-protocol"
+Source = "https://github.com/actaseal/legal-context-protocol"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]

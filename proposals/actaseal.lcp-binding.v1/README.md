@@ -9,7 +9,7 @@ LCP v1 deliberately defines no canonical per-transaction receipt schema
 (see the [spec](https://github.com/legal-context-protocol/legal-context-protocol/blob/main/spec/legal-context-protocol-v1.md));
 protocol stewards invite the ecosystem to publish binding profiles for
 their own receipt shapes. This is one such profile, originally written
-for [ActaSeal](https://github.com/legal-context-protocol/legal-context-protocol)
+for [ActaSeal](https://github.com/actaseal/actaseal-verify)
 and extracted here as a standalone, dependency-free package so it can be
 reused (and reviewed) independent of any one product.
 
@@ -33,8 +33,17 @@ structural `PolicyReceipt` protocol below.
 
 ## Install
 
+Not published to PyPI. Install from this directory:
+
 ```
-pip install lcp-actaseal-binding
+pip install -e .
+```
+
+Run the tests:
+
+```
+pip install -e '.[test]'
+pytest tests/ -v
 ```
 
 ## Usage

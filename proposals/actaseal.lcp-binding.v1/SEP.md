@@ -83,7 +83,24 @@ Normative requirements:
     `LCP_RECEIPT_SIGNATURE_INVALID`;
   - when the terms document bytes are presented, re-hash them and compare
     against the record's claimed `atrHash`, failing with
-    `LCP_TERMS_HASH_MISMATCH` on divergence.
+    `LCP_TERMS_HASH_MISMATCH` on divergence;
+  - compare the record's claimed `atrHash` against the terms hash carried
+    INSIDE the signed receipt (`PolicyReceipt.terms_hash`, bare lowercase
+    SHA-256 hex of the same bytes), failing with
+    `LCP_TERMS_HASH_MISMATCH` on divergence. A receipt that carries no
+    `terms_hash` MUST fail with `LCP_TERMS_NOT_IN_SIGNED_RECEIPT`, never
+    an empty list: without it, no signed material commits to which terms
+    were in force, and re-hashing the presented document against the
+    record's own claim is circular -- an attacker who replaces the terms
+    document and the claimed `atrHash` together produces a record that
+    is internally consistent and passes every other check. A receipt
+    format whose signed payload cannot carry a terms hash cannot
+    conformantly be bound by this profile.
+
+  Correspondingly, `build_lcp_record` MUST refuse (raise) rather than
+  mint a record whose presented terms bytes disagree with the receipt's
+  signed `terms_hash`; a record built over terms the signer never
+  committed to is indistinguishable from an honest one downstream.
   When the terms bytes are NOT presented, the terms binding is unchecked,
   and verification MUST say so by returning
   `LCP_TERMS_BINDING_UNVERIFIED` rather than an empty list. An unchecked
@@ -91,7 +108,8 @@ Normative requirements:
   An empty failure list means verified; every mismatch or unchecked gap
   is individually named (`LCP_FINGERPRINT_MISMATCH`,
   `LCP_BINDING_MISMATCH:<field>`, `LCP_RECEIPT_SIGNATURE_INVALID`,
-  `LCP_TERMS_HASH_MISMATCH`, `LCP_TERMS_BINDING_UNVERIFIED`).
+  `LCP_TERMS_HASH_MISMATCH`, `LCP_TERMS_NOT_IN_SIGNED_RECEIPT`,
+  `LCP_TERMS_BINDING_UNVERIFIED`).
 - This profile performs no network I/O. Fetching
   `/.well-known/legal-context.json` and the terms document is the
   caller's responsibility.

@@ -82,6 +82,10 @@ assert failures == []  # empty list = verified; every mismatch -- or unchecked g
 
 Omitting `terms_document` from `verify_lcp_record` does not mean "pass": if the record claims an `atrHash`, verification returns a named
 `LCP_TERMS_BINDING_UNVERIFIED` entry instead of an empty list, so silence and pass never look alike.
+  A receipt that carries no `terms_hash` at all yields
+  `LCP_TERMS_NOT_IN_SIGNED_RECEIPT`: nothing the signer signed commits to
+  which terms were in force, so checking the document against the record's
+  own claim would be circular.
 
 ## What this package does NOT do
 

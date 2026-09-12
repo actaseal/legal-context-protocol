@@ -32,6 +32,12 @@ LCP_TERMS_HASH_MISMATCH = "LCP_TERMS_HASH_MISMATCH"
 # originated from): a caller that omits terms_document gets this named
 # marker instead of a silent, indistinguishable pass.
 LCP_TERMS_BINDING_UNVERIFIED = "LCP_TERMS_BINDING_UNVERIFIED"
+# The receipt carries no terms_hash, so nothing the SIGNER signed
+# commits to which terms were in force. Re-hashing terms_document
+# against the record's own atrHash is then circular: replace the terms
+# and the claimed hash together and the record stays self-consistent.
+# Reported by shunhe-wang on PR #4, 2026-08-25.
+LCP_TERMS_NOT_IN_SIGNED_RECEIPT = "LCP_TERMS_NOT_IN_SIGNED_RECEIPT"
 
 # Design gaps this profile does not close, stated rather than hidden.
 # Out of scope for this pass per external review 2026-08-26: these are
@@ -81,6 +87,7 @@ def _binding(receipt: PolicyReceipt, manifest: dict) -> dict:
         "receipt_signature": receipt.signature,
         "mandate_hash": receipt.mandate_hash,
         "scope_conformance_headline": manifest["scope_conformance_headline"],
+        "terms_hash": getattr(receipt, "terms_hash", None),
     }
 
 
@@ -101,7 +108,18 @@ def build_lcp_record(
     else:
         unmapped.append("UNMAPPED:terms")
     if terms_document is not None:
-        legal_context["atrHash"] = atr_hash(terms_document)
+        computed = atr_hash(terms_document)
+        signed_terms = getattr(receipt, "terms_hash", None)
+        # Refuse to mint a record whose terms disagree with what the
+        # signer committed to -- it would be indistinguishable from an
+        # honest record to every downstream check.
+        if signed_terms is not None and computed != "0x" + signed_terms:
+            raise ValueError(
+                f"{LCP_TERMS_HASH_MISMATCH}: terms_document hashes to "
+                f"{computed!r}, but the signed receipt commits to "
+                f"terms_hash {signed_terms!r}"
+            )
+        legal_context["atrHash"] = computed
     else:
         unmapped.append("UNMAPPED:atrHash")
     if terms_format is not None:
@@ -196,6 +214,21 @@ def verify_lcp_record(
 
     claimed_atr_hash = (record.get("legalContext") or {}).get("atrHash")
     if claimed_atr_hash is not None:
+        signed_terms = getattr(receipt, "terms_hash", None)
+        if signed_terms is None:
+            failures.append(
+                f"{LCP_TERMS_NOT_IN_SIGNED_RECEIPT}: record claims atrHash "
+                f"{claimed_atr_hash!r}, but the receipt carries no "
+                f"terms_hash, so no signed material commits to which terms "
+                f"were in force -- the terms and the claimed hash can be "
+                f"replaced together and every other check still passes"
+            )
+        elif claimed_atr_hash != "0x" + signed_terms:
+            failures.append(
+                f"{LCP_TERMS_HASH_MISMATCH}: record claims atrHash "
+                f"{claimed_atr_hash!r}, the signed receipt commits to "
+                f"terms_hash {signed_terms!r}"
+            )
         if terms_document is not None:
             recomputed = atr_hash(terms_document)
             if claimed_atr_hash != recomputed:

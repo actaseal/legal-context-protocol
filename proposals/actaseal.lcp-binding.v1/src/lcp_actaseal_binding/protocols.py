@@ -36,3 +36,8 @@ class PolicyReceipt(Protocol):
     timestamp: str
     signature: str
     mandate_hash: Optional[str]
+    # sha256 hex (bare, not 0x-prefixed) of the exact terms-document
+    # bytes the decision was made under, carried INSIDE the signed
+    # receipt. None = the receipt commits to no terms, which this
+    # profile reports rather than passes.
+    terms_hash: Optional[str]

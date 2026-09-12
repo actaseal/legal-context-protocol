@@ -12,6 +12,7 @@ from lcp_actaseal_binding import (
     LCP_RECEIPT_SIGNATURE_INVALID,
     LCP_TERMS_BINDING_UNVERIFIED,
     LCP_TERMS_HASH_MISMATCH,
+    LCP_TERMS_NOT_IN_SIGNED_RECEIPT,
     atr_hash,
     build_lcp_record,
     verify_lcp_record,
@@ -33,6 +34,9 @@ class FakeReceipt:
     timestamp: str = "2026-07-13T00:00:00Z"
     signature: str = "sig-1"
     mandate_hash: Optional[str] = "hash-mandate-1"
+    # bare sha256 of b"terms" -- the REAL_TERMS_DOC these fixtures bind.
+    # A receipt that commits to no terms is its own test case below.
+    terms_hash: Optional[str] = "51d2361f4faea3bc8f9facdbc7d99abb555596a2e51f7b25fd3b41c93587e616"
 
 
 def manifest():
@@ -165,24 +169,40 @@ def test_forged_receipt_signature_fails_closed():
 
 
 def test_record_built_from_swapped_terms_bytes_fails_closed():
+    """Two layers, both asserted. build_lcp_record now refuses outright
+    when the terms disagree with what the receipt signed -- so the forged
+    record cannot even be minted through the normal path. A caller who
+    hand-assembles one anyway must still be caught at verification."""
     receipt = FakeReceipt()
-    # same, genuinely-signed receipt; record built over DIFFERENT terms
-    # bytes than the ones actually agreed to
+    with pytest.raises(ValueError, match=LCP_TERMS_HASH_MISMATCH):
+        build_lcp_record(
+            receipt=receipt,
+            manifest=manifest(),
+            terms_url="https://example.com/terms/v3.md",
+            terms_document=FORGED_TERMS_DOC,
+        )
+
+    # Bypass the builder entirely: mint over the real terms, then swap in
+    # the forged fingerprint and re-derive the record fingerprint so the
+    # record is perfectly self-consistent.
     record = build_lcp_record(
         receipt=receipt,
         manifest=manifest(),
         terms_url="https://example.com/terms/v3.md",
-        terms_document=FORGED_TERMS_DOC,
+        terms_document=REAL_TERMS_DOC,
     )
-    # verifier independently obtains the real terms document
+    record["legalContext"]["atrHash"] = atr_hash(FORGED_TERMS_DOC)
+    body = {k: v for k, v in record.items() if k != "record_fingerprint"}
+    record["record_fingerprint"] = canonical_json_hash(body)
+
     failures = verify_lcp_record(
         record,
         receipt=receipt,
         manifest=manifest(),
         verify_receipt_signature=_accept_signature,
-        terms_document=REAL_TERMS_DOC,
+        terms_document=FORGED_TERMS_DOC,
     )
-    assert any(f.startswith(LCP_TERMS_HASH_MISMATCH) for f in failures)
+    assert any(f.startswith(LCP_TERMS_HASH_MISMATCH) for f in failures), failures
 
 
 def test_tampered_atr_hash_with_recomputed_fingerprint_fails_closed():
@@ -238,3 +258,52 @@ def test_no_actaseal_import_anywhere():
                     assert not alias.name.startswith("actaseal"), path
             if isinstance(node, ast.ImportFrom):
                 assert not (node.module or "").startswith("actaseal"), path
+
+
+def test_reporter_case_swapped_terms_and_hash_together_fails_closed():
+    """Reporter case (shunhe-wang, 2026-08-25): replace the terms AND the
+    record's claimed atrHash so they agree with each other. Must still
+    fail -- the signer committed to the ORIGINAL terms."""
+    receipt = FakeReceipt()
+    record = build_lcp_record(
+        receipt=receipt, manifest=manifest(),
+        terms_url="https://example.com/terms/v3.md",
+        terms_document=REAL_TERMS_DOC, terms_format="text/markdown",
+    )
+    record["legalContext"]["atrHash"] = atr_hash(FORGED_TERMS_DOC)
+    body = {k: v for k, v in record.items() if k != "record_fingerprint"}
+    record["record_fingerprint"] = canonical_json_hash(body)
+    failures = verify_lcp_record(
+        record, receipt=receipt, manifest=manifest(),
+        verify_receipt_signature=_accept_signature,
+        terms_document=FORGED_TERMS_DOC,
+    )
+    assert any(f.startswith(LCP_TERMS_HASH_MISMATCH) for f in failures), failures
+
+
+def test_reporter_case_receipt_without_terms_hash_is_never_a_pass():
+    """Reporter case: a receipt that committed to no terms at all.
+    Re-hashing the document against the record's own claim is circular,
+    so this must be named, not passed."""
+    receipt = FakeReceipt(terms_hash=None)
+    record = build_lcp_record(
+        receipt=receipt, manifest=manifest(),
+        terms_url="https://example.com/terms/v3.md",
+        terms_document=REAL_TERMS_DOC, terms_format="text/markdown",
+    )
+    failures = verify_lcp_record(
+        record, receipt=receipt, manifest=manifest(),
+        verify_receipt_signature=_accept_signature,
+        terms_document=REAL_TERMS_DOC,
+    )
+    assert any(f.startswith(LCP_TERMS_NOT_IN_SIGNED_RECEIPT) for f in failures), failures
+
+
+def test_build_refuses_terms_that_disagree_with_the_signed_receipt():
+    receipt = FakeReceipt()
+    with pytest.raises(ValueError, match=LCP_TERMS_HASH_MISMATCH):
+        build_lcp_record(
+            receipt=receipt, manifest=manifest(),
+            terms_url="https://example.com/terms/v3.md",
+            terms_document=FORGED_TERMS_DOC, terms_format="text/markdown",
+        )

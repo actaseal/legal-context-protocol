@@ -1,0 +1,35 @@
+{
+  "lcp_profile": "actaseal.lcp-binding.v1",
+  "lcp_spec": "legal-context-protocol v1 (legal-context.schema.json)",
+  "legalContext": {
+    "atrHash": "0x5bc04174974fc7cd5d97dd6fe17e79549004f713f1d1e7956aa7fd8bf096259b",
+    "terms": "https://merchant.example/terms/disputed-purchase.txt",
+    "termsFormat": "text/plain"
+  },
+  "not_covered": [
+    "mandate_hash proves a mandate was BOUND to this transaction, not what it authorized, who granted it, whether it had expired, or whether this action fell inside its scope.",
+    "scope_conformance_headline is free text supplied by the manifest producer: it ASSERTS conformance, it does not EVIDENCE it. A verifier must not treat this field as proof of in-scope action."
+  ],
+  "record_fingerprint": "17a6128ac444f97a9599a1f88ef7fe394141d26b12007336741d95b7607f5015",
+  "transactionBinding": {
+    "action_hash": "14c55c4f8792690b37b63600042944122cccf92b931d68b009fe7c07ac627140",
+    "action_id": "purchase-with-terms-1",
+    "decision": "ALLOW",
+    "evidence_set_hash": "d41a2a0f6e07a096b97a2b7a945080c74f1b3c2236808a6a9135443a7aa9e60d",
+    "ledger_entry_hash": "7fc0514dc324df7f2e06a45e5a12dd6b95a2c80d74359a7645df4d2488adb2be",
+    "mandate_hash": null,
+    "reason_code": "POLICY_ALLOW",
+    "receipt_signature": "87763d8384e7054dc5ed9ff965fd848436050666ebb3c8a2eeef03dfbdfcd76a8b327e54b398873aabc0023ea706e6d850224388759c753cd5cf0c92b8d59503",
+    "receipt_timestamp": "2026-09-21T11:10:35.562113+00:00",
+    "scope_conformance_headline": "no IntentScope/ExecutedAction configured for this demo",
+    "terms_hash": "5bc04174974fc7cd5d97dd6fe17e79549004f713f1d1e7956aa7fd8bf096259b"
+  },
+  "unmapped": [
+    "UNMAPPED:acceptanceRequired",
+    "UNMAPPED:disputeResolution",
+    "UNMAPPED:returns",
+    "UNMAPPED:contact",
+    "UNMAPPED:api",
+    "UNMAPPED:mandate_hash"
+  ]
+}

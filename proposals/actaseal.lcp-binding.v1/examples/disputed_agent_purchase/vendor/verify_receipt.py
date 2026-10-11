@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # VENDORED, UNMODIFIED, from the public ActaSeal verifier repo:
 #   github.com/actaseal/actaseal-verify  verify_receipt.py
-#   source commit: e22eb47
+#   source commit: dd85023
 # This script's own docstring states it is standalone by design (no
 # actaseal imports, stdlib + 'cryptography' only) and may be copied
 # unchanged to the public actaseal-verify repo -- this copy exercises
@@ -72,10 +72,56 @@ script only checks the checkpoint names a hash present in the supplied
 slice; it does not itself fetch or validate any transparency log.
 
 Usage: python verify_receipt.py [receipt_file.json] [--checkpoint <hex>]
+                                 [--trust-material-complete] [--emit-result]
+                                 [--receipt-public-key <hex>]
+
+`--receipt-public-key <hex>` pins the operator's published signing key:
+the document's receipt_public_key_hex must equal it (RECEIPT_KEY_NOT_TRUSTED
+otherwise). Independently of that, a receipt's signed signer_pubkey_hash
+must hash-match the document's key (RECEIPT_SIGNER_PUBKEY_HASH_MISMATCH),
+so a receipt re-signed with a swapped-in key fails. Without the pin, a PASS
+says the key was not independently checked.
   receipt_file.json defaults to stdin when omitted.
 Exit codes: 0 PASS, 1 FAIL (signature and/or chain check failed),
 2 malformed input (unreadable JSON, missing required fields, missing
 'cryptography' package).
+
+SCITT-aligned structured result (IETF draft-ietf-scitt-architecture /
+the completeness requirements discussed in PR #463 against it): by
+default this script's output and exit codes are UNCHANGED from before
+this paragraph existed -- the two flags below are purely additive.
+
+`--emit-result` additionally prints ONE line of JSON to stdout, schema
+`actaseal-verify-result.v1`, carrying a `verdict` (CRYPTOGRAPHICALLY_VALID
+/ CRYPTOGRAPHICALLY_INVALID / NOT_EVALUATED) that describes ONLY the
+cryptographic outcome, separately from a `disposition` (ACCEPTED /
+REFUSED_BY_POLICY) that describes what a relying party should do about
+it. A verdict NEVER changes because of a policy decision; disposition
+never carries a crypto outcome. See `_build_structured_result`'s own
+docstring for the exact decision table.
+
+`--trust-material-complete` (boolean, DEFAULT FALSE) is a relying-party
+declaration that the trust material it supplied (here: a single
+`receipt_public_key_hex`, or none) is a COMPLETE account of the keys it
+is willing to trust -- not merely "no key was supplied." Omitting the
+flag is NOT a declaration of completeness; the emitted
+`trust_material_complete` field says so explicitly (`false`) rather
+than being absent. This matters specifically for the keyless/
+`--checkpoint` path (CHAIN_VERIFIED_KEY_UNKNOWN in the human-readable
+output below): without the declaration, an unresolvable key is simply
+not yet evaluated (NOT_EVALUATED / ACCEPTED -- nothing has been
+refused, the check just hasn't run); WITH the declaration, the relying
+party has said this key is definitively outside its trust boundary,
+which is a policy refusal (NOT_EVALUATED / REFUSED_BY_POLICY) -- the
+verdict itself still does not change, because the cryptographic check
+still never ran.
+
+`integrity_protection` in the emitted result is always the literal
+string `"none"`: this is a standalone, offline, unauthenticated script
+with no separately trusted verifier identity of its own, so signing its
+own output would bind the signature to nothing a relying party could
+anchor trust in. State this honestly rather than implying a protection
+that does not exist.
 """
 from __future__ import annotations
 
@@ -230,6 +276,31 @@ def verify_signature(receipt, public_key_hex, failures, crypto):
         TypeError,
     ):
         failures.append("RECEIPT_SIGNATURE_INVALID")
+
+
+def verify_receipt_key_binding(receipt, public_key_hex, failures, pinned_public_key_hex=None):
+    """The document supplies its own receipt_public_key_hex, so a valid
+    signature alone proves nothing about WHO signed. Two checks:
+    the signed signer_pubkey_hash (sha256 of the public key bytes, same
+    for every algorithm) must match the document's key, and an optional
+    relying-party pin (--receipt-public-key) must equal it."""
+    declared_hash = receipt.get("signer_pubkey_hash")
+    if declared_hash:
+        try:
+            actual_hash = hashlib.sha256(bytes.fromhex(public_key_hex)).hexdigest()
+        except ValueError:
+            actual_hash = None
+        if actual_hash != declared_hash:
+            failures.append(
+                "RECEIPT_SIGNER_PUBKEY_HASH_MISMATCH: the signed receipt names signer_pubkey_hash %s, "
+                "but receipt_public_key_hex hashes to %s" % (declared_hash, actual_hash)
+            )
+    if pinned_public_key_hex is not None:
+        if pinned_public_key_hex.strip().lower() != public_key_hex.strip().lower():
+            failures.append(
+                "RECEIPT_KEY_NOT_TRUSTED: document declares receipt key %s, --receipt-public-key is %s"
+                % (public_key_hex, pinned_public_key_hex)
+            )
 
 
 def _chain_hashes(ledger_slice, failures):
@@ -399,7 +470,134 @@ def load_input(source):
     return json.loads(text)
 
 
+RESULT_SCHEMA = "actaseal-verify-result.v1"
+
+VERDICT_VALID = "CRYPTOGRAPHICALLY_VALID"
+VERDICT_INVALID = "CRYPTOGRAPHICALLY_INVALID"
+VERDICT_NOT_EVALUATED = "NOT_EVALUATED"
+
+DISPOSITION_ACCEPTED = "ACCEPTED"
+DISPOSITION_REFUSED = "REFUSED_BY_POLICY"
+
+OUTCOME_ACCEPTED = "ACCEPTED"
+OUTCOME_REJECTED = "REJECTED"
+
+# The sole `failed_checks` entry for every exit-2 "could not even attempt
+# verification" branch (missing 'cryptography', unreadable/invalid JSON,
+# missing required fields): none of the four named checks
+# (signature/checkpoint/legacy_chain/validation_material) ever got far
+# enough to run, so `checks` is `[]`, but `failed_checks` must still name
+# SOMETHING on a real rejection rather than silently reading as empty.
+MALFORMED_INPUT_CHECK = "malformed_input"
+# Same idea for the archive_attestation document branch -- a different
+# artifact type with no receipt/signature in it at all, whose own
+# structural check either passed ([]) or failed (this one identifier).
+ARCHIVE_ATTESTATION_CHECK = "archive_attestation"
+
+
+def _check_entry(name, attempted, failures):
+    if not attempted:
+        return {"check": name, "status": "not_attempted", "detail": None}
+    if failures:
+        return {"check": name, "status": "failed", "detail": "; ".join(failures)}
+    return {"check": name, "status": "passed", "detail": None}
+
+
+def _material_check_entry(warnings, failures):
+    if failures:
+        return {"check": "validation_material", "status": "failed", "detail": "; ".join(failures)}
+    if warnings:
+        return {"check": "validation_material", "status": "warning", "detail": "; ".join(warnings)}
+    return {"check": "validation_material", "status": "passed", "detail": None}
+
+
+def _build_structured_result(*, trust_material_complete, checks, exit_code,
+                              raw_signature_valid=False, signature_attempted=False,
+                              raw_checkpoint_valid=False, failed_checks_override=None):
+    """Decision table (see this module's docstring for the policy
+    rationale). Evaluated in this exact order -- a confirmed failure
+    always outranks "never evaluated," and "never evaluated" is reached
+    the same way whether that's because a keyless/checkpoint PASS
+    succeeded with no key to check, or because no check of any kind
+    could even be attempted:
+
+        raw_signature_valid                -> CRYPTOGRAPHICALLY_VALID / ACCEPTED
+        signature_attempted (and failed)   -> CRYPTOGRAPHICALLY_INVALID / ACCEPTED
+        raw_checkpoint_valid (keyless PASS) -> NOT_EVALUATED / (REFUSED_BY_POLICY if declared complete else ACCEPTED)
+        otherwise (nothing could run)       -> NOT_EVALUATED / (REFUSED_BY_POLICY if declared complete else ACCEPTED)
+
+    `raw_signature_valid`/`raw_checkpoint_valid` are deliberately FROZEN
+    snapshots taken by the caller immediately after the raw cryptographic
+    check ran, before `legacy_chain_failures`/`material_failures` are
+    allowed to override the human-readable PASS/FAIL verdict for
+    non-cryptographic reasons (a broken ledger chain, missing required
+    validation material). This is intentional and produces a narrow,
+    documented divergence: a receipt whose signature math genuinely
+    verifies but whose separately-supplied ledger_slice is broken still
+    reports CRYPTOGRAPHICALLY_VALID here (the signature check itself
+    really did pass).
+
+    THIS divergence is exactly why `verdict` alone is not safe for a
+    consumer to read as "should this receipt be accepted": that receipt
+    is CRYPTOGRAPHICALLY_VALID yet still REJECTED overall (broken chain).
+    `outcome` (ACCEPTED/REJECTED, mapped directly and only from the real
+    `exit_code` this process is about to return -- 0 is ACCEPTED,
+    anything else is REJECTED, no third value) and `failed_checks` (the
+    `checks` entries with status "failed", or `failed_checks_override`
+    for branches where `checks` itself is empty but something was still
+    rejected) exist so a consumer never has to infer acceptability from
+    `verdict` alone -- `verdict` stays the pure cryptographic fact,
+    `outcome`/`exit_code`/`failed_checks` carry the overall, consumable
+    result."""
+    if raw_signature_valid:
+        verdict, disposition = VERDICT_VALID, DISPOSITION_ACCEPTED
+    elif signature_attempted:
+        verdict, disposition = VERDICT_INVALID, DISPOSITION_ACCEPTED
+    else:
+        # raw_checkpoint_valid or not, this is the same "no genuine
+        # crypto evaluation occurred" case reached via two different
+        # paths (a keyless-but-chain-verified PASS, or nothing to check
+        # at all) -- both resolve identically against the completeness
+        # declaration, intentionally collapsed into one branch rather
+        # than written out twice.
+        verdict = VERDICT_NOT_EVALUATED
+        disposition = DISPOSITION_REFUSED if trust_material_complete else DISPOSITION_ACCEPTED
+    if failed_checks_override is not None:
+        failed_checks = list(failed_checks_override)
+    else:
+        failed_checks = [c["check"] for c in checks if c["status"] == "failed"]
+    outcome = OUTCOME_ACCEPTED if exit_code == 0 else OUTCOME_REJECTED
+    return {
+        "schema": RESULT_SCHEMA,
+        "verdict": verdict,
+        "disposition": disposition,
+        "trust_material_complete": bool(trust_material_complete),
+        "integrity_protection": "none",
+        "checks": checks,
+        "outcome": outcome,
+        "exit_code": exit_code,
+        "failed_checks": failed_checks,
+    }
+
+
+def _print_structured_result(emit_result, result):
+    if emit_result:
+        print(canonical_dumps(result))
+
+
 def main(argv):
+    # Parsed first, before anything else can fail/return early: both are
+    # boolean presence flags (no value), so every downstream early-return
+    # path (missing 'cryptography', malformed JSON, etc.) still knows
+    # whether to emit a structured result and what trust_material_complete
+    # to report -- --trust-material-complete's value is honored even on
+    # an input that never got far enough to be cryptographically checked.
+    args = list(argv[1:])
+    emit_result = "--emit-result" in args
+    args = [a for a in args if a != "--emit-result"]
+    trust_material_complete = "--trust-material-complete" in args
+    args = [a for a in args if a != "--trust-material-complete"]
+
     try:
         from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
         from cryptography.hazmat.primitives import hashes
@@ -408,6 +606,10 @@ def main(argv):
         from cryptography.hazmat.primitives.serialization import load_der_public_key
     except ImportError:
         print("UNABLE_TO_RUN: the 'cryptography' package is required (pip install cryptography)")
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+            failed_checks_override=[MALFORMED_INPUT_CHECK],
+        ))
         return 2
     crypto = {
         "ed25519_public_key_cls": Ed25519PublicKey,
@@ -417,7 +619,6 @@ def main(argv):
         "ecdsa_sha256": ec.ECDSA(hashes.SHA256()),
     }
 
-    args = list(argv[1:])
     checkpoint_hash = None
     if "--checkpoint" in args:
         flag_index = args.index("--checkpoint")
@@ -426,6 +627,25 @@ def main(argv):
         except IndexError:
             print("FAIL")
             print("  MALFORMED_INPUT: --checkpoint requires a value")
+            _print_structured_result(emit_result, _build_structured_result(
+                trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+                failed_checks_override=[MALFORMED_INPUT_CHECK],
+            ))
+            return 2
+        args = args[:flag_index] + args[flag_index + 2 :]
+
+    pinned_public_key_hex = None
+    if "--receipt-public-key" in args:
+        flag_index = args.index("--receipt-public-key")
+        try:
+            pinned_public_key_hex = args[flag_index + 1]
+        except IndexError:
+            print("FAIL")
+            print("  MALFORMED_INPUT: --receipt-public-key requires a value")
+            _print_structured_result(emit_result, _build_structured_result(
+                trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+                failed_checks_override=[MALFORMED_INPUT_CHECK],
+            ))
             return 2
         args = args[:flag_index] + args[flag_index + 2 :]
 
@@ -439,11 +659,19 @@ def main(argv):
     except (OSError, ValueError) as exc:
         print("FAIL")
         print("  MALFORMED_INPUT: unreadable or invalid JSON: %s" % exc)
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+            failed_checks_override=[MALFORMED_INPUT_CHECK],
+        ))
         return 2
 
     if not isinstance(document, dict):
         print("FAIL")
         print("  MALFORMED_INPUT: top-level JSON must be an object")
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+            failed_checks_override=[MALFORMED_INPUT_CHECK],
+        ))
         return 2
 
     # ONESHOT-AUDIT Task B: a document carrying "archive_attestation" is
@@ -451,6 +679,12 @@ def main(argv):
     # branch out to its own verdict before the receipt-required checks
     # below, which do not apply here.
     if "archive_attestation" in document:
+        # A different document shape with no PolicyDecisionReceipt
+        # signature in it at all -- there is no cryptographic signature
+        # check for the structured result to describe either way, PASS
+        # or FAIL, so both report NOT_EVALUATED / ACCEPTED (nothing was
+        # refused; the result format's single-receipt cryptographic
+        # question simply does not apply to this artifact type).
         attestation_failures = []
         if verify_archive_attestation_document(document, attestation_failures):
             print("PASS")
@@ -458,11 +692,18 @@ def main(argv):
             print("  NOTE: structural check only -- workpaper set matches the attested subject. "
                   "Anchor cryptography (TSA/STH) not independently re-verified by this script; "
                   "use actaseal.archive.attestation.verify_archive_attestation for that.")
+            _print_structured_result(emit_result, _build_structured_result(
+                trust_material_complete=trust_material_complete, checks=[], exit_code=0,
+            ))
             return 0
         print("FAIL")
         print("  verdict: ARCHIVE_ATTESTATION_FAILED")
         for failure in attestation_failures:
             print("  " + failure)
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=1,
+            failed_checks_override=[ARCHIVE_ATTESTATION_CHECK],
+        ))
         return 1
 
     receipt = document.get("receipt")
@@ -470,6 +711,10 @@ def main(argv):
     if not isinstance(receipt, dict):
         print("FAIL")
         print("  MALFORMED_INPUT: missing or non-object 'receipt' field")
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+            failed_checks_override=[MALFORMED_INPUT_CHECK],
+        ))
         return 2
     # T5: receipt_public_key_hex is required UNLESS a --checkpoint was
     # supplied -- keyless mode may have no key at all to offer.
@@ -477,6 +722,10 @@ def main(argv):
     if not have_key and checkpoint_hash is None:
         print("FAIL")
         print("  MALFORMED_INPUT: missing 'receipt_public_key_hex' field")
+        _print_structured_result(emit_result, _build_structured_result(
+            trust_material_complete=trust_material_complete, checks=[], exit_code=2,
+            failed_checks_override=[MALFORMED_INPUT_CHECK],
+        ))
         return 2
 
     ledger_slice = document.get("ledger_slice")
@@ -485,13 +734,24 @@ def main(argv):
     signature_attempted = have_key
     if have_key:
         verify_signature(receipt, public_key_hex, signature_failures, crypto)
+        verify_receipt_key_binding(receipt, public_key_hex, signature_failures, pinned_public_key_hex)
     signature_verified = signature_attempted and not signature_failures
+    # Frozen snapshot of the RAW cryptographic outcome, taken before
+    # legacy_chain_failures/material_failures (below) are allowed to
+    # override signature_verified for non-cryptographic reasons. The
+    # structured --emit-result verdict describes ONLY this raw outcome
+    # -- see _build_structured_result's docstring for why that is a
+    # deliberate, documented divergence from the human-readable PASS/
+    # FAIL decided further down in this function.
+    raw_signature_valid = signature_verified
 
     checkpoint_failures = []
     checkpoint_attempted = checkpoint_hash is not None
     if checkpoint_attempted:
         verify_checkpoint_chain(receipt, ledger_slice, checkpoint_hash, checkpoint_failures)
     checkpoint_verified = checkpoint_attempted and not checkpoint_failures
+    # Same frozen-snapshot reasoning as raw_signature_valid above.
+    raw_checkpoint_valid = checkpoint_verified
 
     # Legacy (no --checkpoint) chain check: ledger_slice, if present, is
     # still validated as an unbroken chain containing the receipt's
@@ -500,7 +760,8 @@ def main(argv):
     # double-reporting the same chain walk under two different failure
     # lists).
     legacy_chain_failures = []
-    if not checkpoint_attempted and ledger_slice is not None:
+    legacy_chain_attempted = not checkpoint_attempted and ledger_slice is not None
+    if legacy_chain_attempted:
         verify_chain(receipt, ledger_slice, legacy_chain_failures)
 
     # A signature-only PASS must still respect the legacy (non-checkpoint)
@@ -516,14 +777,41 @@ def main(argv):
         signature_verified = False
         checkpoint_verified = False
 
+    checks = [
+        _check_entry("signature", signature_attempted, signature_failures),
+        _check_entry("checkpoint", checkpoint_attempted, checkpoint_failures),
+        _check_entry("legacy_chain", legacy_chain_attempted, legacy_chain_failures),
+        _material_check_entry(material_warnings, material_failures),
+    ]
+
+    def _result_for(exit_code):
+        # Built fresh at each return site with the REAL exit code that
+        # site is about to return, rather than computed once and reused
+        # across branches with different codes -- outcome/exit_code must
+        # never drift from what main() actually returns.
+        return _build_structured_result(
+            trust_material_complete=trust_material_complete,
+            checks=checks,
+            exit_code=exit_code,
+            raw_signature_valid=raw_signature_valid,
+            signature_attempted=signature_attempted,
+            raw_checkpoint_valid=raw_checkpoint_valid,
+        )
+
     if signature_verified:
         # Strongest available verdict: a real signature check passed.
         # Reported regardless of whether --checkpoint was also supplied.
         print("PASS")
         print("  verdict: %s" % receipt.get("decision"))
         print("  mode: SIGNATURE_VERIFIED")
+        if pinned_public_key_hex is not None:
+            print("  receipt key matches --receipt-public-key (checked against the key you supplied)")
+        else:
+            print("  receipt key NOT checked against an independent key (no --receipt-public-key given); "
+                  "the document itself declares %s -- compare it with the operator's published key" % public_key_hex)
         for warning in material_warnings:
             print("  WARNING: " + warning)
+        _print_structured_result(emit_result, _result_for(0))
         return 0
 
     if checkpoint_verified:
@@ -537,6 +825,7 @@ def main(argv):
         print("  mode: CHAIN_VERIFIED_KEY_UNKNOWN")
         for warning in material_warnings:
             print("  WARNING: " + warning)
+        _print_structured_result(emit_result, _result_for(0))
         return 0
 
     print("FAIL")
@@ -549,6 +838,7 @@ def main(argv):
         print("  " + failure)
     for failure in material_failures:
         print("  " + failure)
+    _print_structured_result(emit_result, _result_for(1))
     return 1
 
 
